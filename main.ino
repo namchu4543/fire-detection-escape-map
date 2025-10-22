@@ -1,408 +1,325 @@
-/************************************************************
- * 프로젝트: LED 기반 화재감지형 피난안내도 (확장형 기본 틀, v2)
- * 파일: main.ino (단일 파일)
- * 의도:
- *  - setup/loop 최소화 + 태스크(논블로킹) 분리
- *  - 센서 안정화(이동평균) + 히스테리시스 임계
- *  - 상태머신(정상/주의/위험)으로 렌더/부저/경로로직 일원화
- *  - 네오픽셀/추가 센서(Flame, DHT, RTC/SD) 손쉽게 확장
- ************************************************************/
+/*
+  화재감지 피난안내 – 동작 예제 (Arduino Mega)
+  - 센서: Flame AO(A0), DO(D2, 인터럽트)
+  - 통신: HC-06 (Serial1: RX1=D19, TX1=D18)
+  - LED(2색): 내부 좌/우 (각 RED, GREEN), 외부 좌/우(녹색만)
+  - 상태머신: NORMAL / CAUTION / DANGER
+  - 명령: "ALARM Z1|Z2|Z3|Z4", "CLEAR", "MODE AUTO|MANUAL"
+*/
 
-/* ====================== 기능 스위치(빌드 옵션) ======================= */
-// 필요시 1로 바꾸고 라이브러리 추가 설치
-#define USE_NEOPIXEL   0   // 1: Adafruit_NeoPixel 사용, 0: 보드 LED로 대체
-#define USE_FLAME      0   // 1: 불꽃센서 사용 예시
-#define USE_DHT        0   // 1: DHT22 사용 예시
-
-/* ===================== 보드/플랫폼 호환 가드 ======================== */
 #ifndef IRAM_ATTR
-  #define IRAM_ATTR /* AVR(UNO 등)에서는 무시 */
+#define IRAM_ATTR
 #endif
 
-/* =========================== 핀 설정 ================================ */
-// 프로젝트에 맞게 수정
-const uint8_t PIN_LED_STRIP = 6;     // WS2812B 데이터핀 (예정)
-const uint8_t PIN_BUZZER    = 9;     // 부저
-const uint8_t PIN_BTN_INT   = 2;     // 인터럽트 버튼(예: INT0)
-const uint8_t PIN_MQ2_AO    = A0;    // MQ-2 아날로그 입력
-const uint8_t PIN_STATUSLED = 13;    // 보드 내장 LED(동작 확인)
+/* ---------------- Pins ---------------- */
+#define PIN_FLAME_AO    A0
+#define PIN_FLAME_DO    2    // 인터럽트
 
-/*재근이 ㅇㅇㅇㅇㅇㅇㅇㅇㅇ*/
+// 내부 대피로(좌/우) – 2색 LED 가정 (MOSFET 게이트에 연결)
+#define PIN_IL_G        5    // 내부 좌 GREEN
+#define PIN_IL_R        6    // 내부 좌 RED
+#define PIN_IR_G        7    // 내부 우 GREEN
+#define PIN_IR_R        8    // 내부 우 RED
 
-#if USE_FLAME
-const uint8_t PIN_FLAME_DO  = 3;     // 불꽃센서 디지털 출력 (예시)
-#endif
+// 외부 방향지시(좌/우) – 녹색만 사용
+#define PIN_EL_G        10   // 외부 좌 GREEN
+#define PIN_ER_G        11   // 외부 우 GREEN
 
-/* ========================= 타이밍(논블로킹) ========================= */
-const uint32_t INTERVAL_READ_SENSORS = 100;   // 센서 읽기
-const uint32_t INTERVAL_UPDATE_LOGIC = 100;   // 상태/경로
-const uint32_t INTERVAL_RENDER_LEDS  = 25;    // LED 애니메이션
-const uint32_t INTERVAL_BEEP_ENGINE  = 10;    // 부저 패턴 엔진
-const uint32_t INTERVAL_LOG_OUTPUT   = 500;   // 시리얼 로그
+#define PIN_BUZZER      9    // 옵션
 
-uint32_t tReadSensors=0, tUpdateLogic=0, tRenderLEDs=0, tBeep=0, tLogOutput=0;
+// 블루투스 (HC-06) – Mega의 Serial1 사용
+// RX1=D19, TX1=D18 (하드웨어 고정)
 
-/* ========================= 전역 상태/구조체 ========================= */
-// 시스템 모드(예: 수동/자동)
-enum SystemMode : uint8_t { MODE_AUTO=0, MODE_MANUAL=1 };
+/* --------------- Thresholds (tune) --------------- */
+#define T_CAUTION_ON    320
+#define T_CAUTION_OFF   300
+#define T_DANGER_ON     380
+#define T_DANGER_OFF    360
 
-// 경보 상태머신
+/* --------------- Timing (ms) --------------- */
+const uint32_t INTERVAL_READ_SENSORS = 100;
+const uint32_t INTERVAL_UPDATE_LOGIC = 100;
+const uint32_t INTERVAL_RENDER_LEDS  = 30;
+const uint32_t INTERVAL_BEEP_ENGINE  = 10;
+const uint32_t INTERVAL_LOG_OUTPUT   = 500;
+
+/* --------------- Globals --------------- */
 enum AlarmState : uint8_t { STATE_NORMAL=0, STATE_CAUTION=1, STATE_DANGER=2 };
+enum SystemMode  : uint8_t { MODE_AUTO=0,  MODE_MANUAL=1 };
 
-// 센서 버퍼(이동평균)
-const uint8_t MQ2_WIN = 8;     // 이동평균 창 크기
-int mq2Buf[MQ2_WIN] = {0};
-uint8_t mq2Idx = 0;
-long mq2Sum = 0;
-int g_mq2Raw = 0;              // 최근 읽은 생(raw)
-int g_mq2Avg = 0;              // 이동평균
+volatile bool     g_irqFlag = false;    // DO 인터럽트 플래그
+volatile uint32_t g_irqTick = 0;        // 디바운스용
 
-#if USE_FLAME
-bool g_flame = false;          // 불꽃 감지 여부
-#endif
-
-// 히스테리시스 임계 (예시값, 프로젝트에 맞게 보정)
-const int MQ2_CAUTION_ON  = 320;
-const int MQ2_CAUTION_OFF = 300;
-const int MQ2_DANGER_ON   = 380;
-const int MQ2_DANGER_OFF  = 360;
-
-// 경로/차단 (데모)
-bool g_blocked   = false;  // 차단 영역
-int  g_pathDir   = +1;     // -1 좌 / +1 우 (데모 토글)
 AlarmState g_state = STATE_NORMAL;
 SystemMode g_mode  = MODE_AUTO;
 
-// 버튼 인터럽트
-volatile bool     g_btnInterruptFlag = false;
-volatile uint32_t g_btnLastTick      = 0;     // 디바운스
+uint32_t tRead=0, tLogic=0, tLED=0, tBeep=0, tLog=0;
 
-/* ========================= 네오픽셀(옵션) =========================== */
-#if USE_NEOPIXEL
-  #include <Adafruit_NeoPixel.h>
-  const uint16_t NUM_PIXELS = 30; // 세그먼트/존 구성에 맞춰 조정
-  Adafruit_NeoPixel strip(NUM_PIXELS, PIN_LED_STRIP, NEO_GRB + NEO_KHZ800);
-  // ▷ 세그먼트/존 테이블을 배열로 만들어서 "경로만 녹색 러닝" 등의 연출에 활용
-  //   예: const uint8_t SEG_EXIT[] = {0,1,2,3,4,5};
-#endif
+// MQ-2/Flame AO 이동평균
+const uint8_t WIN = 8;
+int   mqBuf[WIN]={0};
+uint8_t mqIdx=0;
+long  mqSum=0;
+int   g_mqRaw=0, g_mqAvg=0;
 
-/* =========================== 부저 패턴 ============================== */
-/*
- * 간단 패턴 엔진(논블로킹)
- * - 상태에 따라 다른 패턴을 구성(주파수, 구간, 반복)
- * - tone()은 비동기지만 지연을 넣지 않고 스케줄만 관리
- */
+// 시뮬레이션용 화재 구역 (Z1..Z4) – 좌계열: Z1/Z2, 우계열: Z3/Z4
+int g_fireZone = 0; // 0=없음, 1~4
+
+// 블루투스 입력 버퍼
+String btLine;
+
+/* --------------- Beep pattern --------------- */
 struct BeepStep { uint16_t freq; uint16_t dur; uint16_t gap; };
-const BeepStep PATTERN_NORMAL[]  = {{0,   0,  0}};                      // 무음
-const BeepStep PATTERN_CAUTION[] = {{2000,120,180}, {0,0,400}};         // 비프-쉼 반복
-const BeepStep PATTERN_DANGER[]  = {{2500,160,90}, {2500,160,300}};     // 빠른 이중 비프
-
+const BeepStep PATTERN_NORMAL[]  = {{0,0,0}};
+const BeepStep PATTERN_CAUTION[] = {{2000,120,180},{0,0,400}};
+const BeepStep PATTERN_DANGER[]  = {{2500,160,90},{2500,160,300}};
 const BeepStep* g_beepPtr = PATTERN_NORMAL;
-uint8_t g_beepIdx = 0;
-uint32_t g_beepTick = 0;
-bool g_beepOn = false;
+uint8_t  g_beepIdx = 0;
+uint32_t g_beepTick= 0;
+bool     g_beepOn  = false;
 
-/* ========================= 전방 선언 ================================ */
-// 초기화
-void initPins();
-void initSerial();
-void initInterrupts();
-void initNeopixelIfEnabled();
-
-// 태스크
-void readSensorsTask();
-void updateLogicTask();
-void renderLedsTask();
-void beepEngineTask();
-void logTask();
-
-// 상태처리
-void updateStateFromSensors();
-void applyStateSideEffects(AlarmState s);
-
-// 유틸
-bool timePassed(uint32_t &tPrev, uint32_t interval);
-
-// ISR
-void IRAM_ATTR isrButton();
-
-/* ============================ setup ================================ */
-void setup() {
-  initPins();
-  initSerial();
-  initInterrupts();
-  initNeopixelIfEnabled();
-
-  Serial.println(F("System Initialized."));
-  digitalWrite(PIN_STATUSLED, HIGH);
-  delay(80);
-  digitalWrite(PIN_STATUSLED, LOW);
+/* --------------- Utilities --------------- */
+bool timePassed(uint32_t &tPrev, uint32_t interval){
+  uint32_t now = millis();
+  if (now - tPrev >= interval){ tPrev = now; return true; }
+  return false;
 }
 
-/* ============================= loop ================================ */
-void loop() {
-  // 1) 인터럽트 이벤트(최우선)
-  if (g_btnInterruptFlag) {
-    g_btnInterruptFlag = false;
-    // TODO: 버튼 행동 정의
-    //  - 짧게: 수동/자동 토글
-    //  - 길게: 시스템 리셋 등
-    g_mode = (g_mode==MODE_AUTO) ? MODE_MANUAL : MODE_AUTO;
-    Serial.print(F("[BTN] mode="));
-    Serial.println(g_mode==MODE_AUTO?"AUTO":"MANUAL");
-  }
-
-  // 2) 태스크 스케줄
-  if (timePassed(tReadSensors, INTERVAL_READ_SENSORS)) readSensorsTask();
-  if (timePassed(tUpdateLogic, INTERVAL_UPDATE_LOGIC)) updateLogicTask();
-  if (timePassed(tRenderLEDs,  INTERVAL_RENDER_LEDS )) renderLedsTask();
-  if (timePassed(tBeep,        INTERVAL_BEEP_ENGINE))  beepEngineTask();
-  if (timePassed(tLogOutput,   INTERVAL_LOG_OUTPUT ))  logTask();
+void IRAM_ATTR isrDO(){
+  uint32_t now = millis();
+  if (now - g_irqTick < 15) return;
+  g_irqTick = now;
+  g_irqFlag = true;
 }
 
-/* ========================== 초기화 구현 ============================= */
-void initPins() {
-  pinMode(PIN_STATUSLED, OUTPUT);
-  pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_BTN_INT, INPUT_PULLUP);
-  // MQ-2: 아날로그 입력이므로 pinMode 불필요
-#if USE_FLAME
-  pinMode(PIN_FLAME_DO, INPUT); // 필요시 INPUT_PULLUP
-#endif
+/* --------------- LED helpers --------------- */
+// 2색 LED 제어(상호배타) – common cathode 기준(LOW=OFF/HIGH=ON)라면 로직 반전 필요
+// 여기서는 MOSFET Low-side 스위칭(게이트 HIGH=ON) 기준으로 작성
+void setLeft(bool redOn, bool greenOn){
+  digitalWrite(PIN_IL_R, redOn   ? HIGH : LOW);
+  digitalWrite(PIN_IL_G, greenOn ? HIGH : LOW);
+}
+void setRight(bool redOn, bool greenOn){
+  digitalWrite(PIN_IR_R, redOn   ? HIGH : LOW);
+  digitalWrite(PIN_IR_G, greenOn ? HIGH : LOW);
+}
+void setExt(bool leftG, bool rightG){
+  digitalWrite(PIN_EL_G, leftG  ? HIGH : LOW);
+  digitalWrite(PIN_ER_G, rightG ? HIGH : LOW);
 }
 
-void initSerial() {
-  Serial.begin(115200);
-  while(!Serial) { ; } // 일부 보드에서만 의미
+/* --------------- State / Policy --------------- */
+void applyStateSideEffects(AlarmState s){
+  if (s==STATE_DANGER) tone(PIN_BUZZER, 3000, 200);
 }
 
-void initInterrupts() {
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN_INT), isrButton, FALLING);
-}
+void updateStateFromSensors(){
+  AlarmState prev = g_state;
 
-void initNeopixelIfEnabled() {
-#if USE_NEOPIXEL
-  strip.begin();
-  strip.setBrightness(80); // TODO: 환경에 맞게 조정
-  strip.show();            // 모두 OFF
-#endif
-}
-
-/* =========================== 태스크 구현 ============================ */
-void readSensorsTask() {
-  // ① MQ-2 가스센서 읽기 + 이동평균
-  int raw = analogRead(PIN_MQ2_AO);
-  g_mq2Raw = raw;
-  mq2Sum -= mq2Buf[mq2Idx];
-  mq2Buf[mq2Idx] = raw;
-  mq2Sum += raw;
-  mq2Idx = (mq2Idx + 1) % MQ2_WIN;
-  g_mq2Avg = (int)(mq2Sum / MQ2_WIN);
-
-#if USE_FLAME
-  // ② 불꽃센서(선택)
-  g_flame = digitalRead(PIN_FLAME_DO) == LOW; // 센서 모델에 따라 Active Low
-#endif
-
-#if USE_DHT
-  // ③ DHT22 (라이브러리 포함 시)
-  //    float t = dht.readTemperature();
-  //    float h = dht.readHumidity();
-  //    if (!isnan(t) && !isnan(h)) { ... 위험 판정 반영 ... }
-#endif
-}
-
-void updateLogicTask() {
-  // ① 센서 -> 상태머신 갱신
-  updateStateFromSensors();
-
-  // ② 차단/경로(데모): 실제는 지도/세그먼트 기반으로 계산
-  g_blocked = (g_state == STATE_DANGER);
-
-  // 방향 데모 토글
-  static uint32_t lastToggle = 0;
-  if (millis() - lastToggle > 2500) {
-    g_pathDir = -g_pathDir;
-    lastToggle = millis();
-  }
-}
-
-void renderLedsTask() {
-#if USE_NEOPIXEL
-  // ===================== 네오픽셀 구현부 ======================
-  // 상태별 컬러/패턴
-  //  - NORMAL : 녹색 점등(약한 브리딩)
-  //  - CAUTION: 주황색 점멸
-  //  - DANGER : 빨강 점멸 + 출구 방향 러닝(녹색)
-  static uint8_t phase = 0;
-  phase++;
-
-  strip.clear();
-
-  if (g_state == STATE_NORMAL) {
-    uint8_t bri = 50 + (uint8_t)(30.0 * (1+sin(phase*0.05))); // 간단 브리딩
-    for (uint16_t i=0;i<strip.numPixels();++i) strip.setPixelColor(i, strip.Color(0, bri, 0));
-  } else if (g_state == STATE_CAUTION) {
-    bool blink = ((millis()/300)%2)==0;
-    for (uint16_t i=0;i<strip.numPixels();++i) strip.setPixelColor(i, blink?strip.Color(255,80,0):0);
+  if (g_state==STATE_NORMAL){
+    if (g_mqAvg >= T_CAUTION_ON) g_state=STATE_CAUTION;
+    if (g_mqAvg >= T_DANGER_ON)  g_state=STATE_DANGER;
+  } else if (g_state==STATE_CAUTION){
+    if (g_mqAvg < T_CAUTION_OFF) g_state=STATE_NORMAL;
+    if (g_mqAvg >= T_DANGER_ON)  g_state=STATE_DANGER;
   } else { // DANGER
-    bool blink = ((millis()/180)%2)==0;
-    for (uint16_t i=0;i<strip.numPixels();++i) strip.setPixelColor(i, blink?strip.Color(255,0,0):0);
-    // ▷ 출구 방향 러닝(간단 예시)
-    static uint16_t head=0;
-    head = (head + (g_pathDir>0?1:strip.numPixels()-1)) % strip.numPixels();
-    strip.setPixelColor(head, strip.Color(0, 180, 0));
+    if (g_mqAvg < T_DANGER_OFF)  g_state=STATE_CAUTION;
+    if (g_mqAvg < T_CAUTION_OFF) g_state=STATE_NORMAL;
   }
 
-  strip.show();
-#else
-  // =================== 네오픽셀 미사용(보드 LED) ===================
-  static bool blink=false; blink=!blink;
-  if (g_state == STATE_NORMAL) {
-    digitalWrite(PIN_STATUSLED, HIGH);
-  } else if (g_state == STATE_CAUTION) {
-    digitalWrite(PIN_STATUSLED, blink?HIGH:LOW);        // 느린 점멸
-  } else {
-    digitalWrite(PIN_STATUSLED, (millis()/120)%2?HIGH:LOW); // 빠른 점멸
+  // 디지털 인터럽트가 오면 즉시 DANGER
+  if (g_irqFlag){ g_irqFlag=false; g_state=STATE_DANGER; }
+
+  if (prev!=g_state){
+    applyStateSideEffects(g_state);
+    Serial.print(F("[STATE] "));
+    Serial.println(g_state==STATE_NORMAL?"NORMAL":g_state==STATE_CAUTION?"CAUTION":"DANGER");
   }
-#endif
 }
 
-void beepEngineTask() {
-  // 상태에 따라 패턴 포인터 갱신
+/* --------------- Tasks --------------- */
+void readSensorsTask(){
+  int raw = analogRead(PIN_FLAME_AO);
+  g_mqRaw = raw;
+  mqSum -= mqBuf[mqIdx];
+  mqBuf[mqIdx] = raw;
+  mqSum += raw;
+  mqIdx = (mqIdx+1)%WIN;
+  g_mqAvg = (int)(mqSum/WIN);
+}
+
+void updateLogicTask(){
+  if (g_mode==MODE_AUTO){
+    updateStateFromSensors();
+  }
+  // g_fireZone은 BT 시뮬레이션 전용 (AUTO에서도 실제 DO가 들어오면 DANGER)
+}
+
+void renderLedsTask(){
+  // 기본 정책:
+  // - 내부: 화재 구역과 "연결"된 쪽은 RED, 반대는 GREEN
+  // - 외부: 화재가 왼쪽계열(Z1/Z2)이면 오른쪽 외부 GREEN, 오른쪽계열(Z3/Z4)이면 왼쪽 GREEN
+  // - NORMAL: 꺼짐(또는 상태표시만 GREEN 약하게), CAUTION: 저속점멸, DANGER: 고정점등(외부는 빠른 점멸 가능)
+
+  static bool slowBlink = false;
+  static bool fastBlink = false;
+  static uint32_t tSlow=0, tFast=0;
+  if (timePassed(tSlow, 500)) slowBlink = !slowBlink;   // 0.5Hz
+  if (timePassed(tFast, 150)) fastBlink = !fastBlink;   // ~3.3Hz
+
+  bool leftIsFire  = (g_fireZone==1 || g_fireZone==2);
+  bool rightIsFire = (g_fireZone==3 || g_fireZone==4);
+
+  // 내부 좌/우 색 결정
+  bool L_R=false, L_G=false, R_R=false, R_G=false;
+  if (g_state==STATE_NORMAL){
+    // 기본 소등
+    L_R=L_G=R_R=R_G=false;
+  } else if (g_state==STATE_CAUTION){
+    // 주의: 저속 점멸, 구역 연결 규칙은 유지
+    if (leftIsFire){ L_R = slowBlink; R_G = slowBlink; }
+    else if (rightIsFire){ R_R = slowBlink; L_G = slowBlink; }
+    else{
+      // 화재 구역 미지정 시 양쪽 녹색 저속 점멸
+      L_G = R_G = slowBlink;
+    }
+  } else { // DANGER
+    if (leftIsFire){ L_R = true;  R_G = true; }
+    else if (rightIsFire){ R_R = true; L_G = true; }
+    else{
+      // 구역 미지정 DANGER면 양쪽 적색 점등(정책)
+      L_R = R_R = true;
+    }
+  }
+  setLeft(L_R, L_G);
+  setRight(R_R, R_G);
+
+  // 외부 방향지시 (녹색만)
+  bool extL=false, extR=false;
+  if (g_state==STATE_NORMAL){
+    extL=extR=false;
+  } else if (g_state==STATE_CAUTION){
+    if (leftIsFire)      { extR = slowBlink; }
+    else if (rightIsFire){ extL = slowBlink; }
+  } else { // DANGER
+    if (leftIsFire)      { extR = fastBlink; }  // 반대방향 빠른 점멸
+    else if (rightIsFire){ extL = fastBlink; }
+  }
+  setExt(extL, extR);
+}
+
+void beepEngineTask(){
+  // 상태별 패턴 포인터 선택
   const BeepStep* target =
     (g_state==STATE_NORMAL)? PATTERN_NORMAL :
     (g_state==STATE_CAUTION)?PATTERN_CAUTION : PATTERN_DANGER;
 
-  if (target != g_beepPtr) {
-    g_beepPtr = target;
-    g_beepIdx = 0;
-    g_beepOn  = false;
-    g_beepTick= millis();
+  if (target != g_beepPtr){
+    g_beepPtr = target; g_beepIdx=0; g_beepOn=false; g_beepTick=millis();
   }
 
-  // 패턴 구동(논블로킹)
   const BeepStep step = g_beepPtr[g_beepIdx];
-  if (step.freq==0 && step.dur==0 && step.gap==0) {
-    noTone(PIN_BUZZER);
-    return; // 무음 패턴
-  }
+  if (step.freq==0 && step.dur==0 && step.gap==0){ noTone(PIN_BUZZER); return; }
 
   uint32_t now = millis();
-  if (!g_beepOn) {
-    // gap 진행 중
-    if (now - g_beepTick >= step.gap) {
-      // 톤 켜기
+  if (!g_beepOn){
+    if (now - g_beepTick >= step.gap){
       if (step.freq>0 && step.dur>0) tone(PIN_BUZZER, step.freq, step.dur);
-      g_beepOn = true;
-      g_beepTick = now;
+      g_beepOn = true; g_beepTick = now;
     }
   } else {
-    // dur 경과 시 다음 스텝
-    if (now - g_beepTick >= step.dur) {
-      g_beepOn = false;
-      g_beepIdx++;
-      // 배열 끝이면 처음으로
-      // (마지막 요소 다음에 {0,0,?} 같은 휴지 추가 시 자연 반복)
-      if (g_beepPtr[g_beepIdx].freq==0 && g_beepPtr[g_beepIdx].dur==0 && g_beepPtr[g_beepIdx].gap==0) {
-        g_beepIdx = 0;
-      }
+    if (now - g_beepTick >= step.dur){
+      g_beepOn = false; g_beepIdx++;
+      // 패턴 반복
+      const BeepStep next = g_beepPtr[g_beepIdx];
+      if (next.freq==0 && next.dur==0 && next.gap==0) g_beepIdx=0;
       g_beepTick = now;
     }
   }
 }
 
-void logTask() {
-  Serial.print(F("[MQ2 raw/avg] "));
-  Serial.print(g_mq2Raw); Serial.print(F("/")); Serial.print(g_mq2Avg);
-
-#if USE_FLAME
-  Serial.print(F("  [flame] ")); Serial.print(g_flame);
-#endif
-
+void logTask(){
+  Serial.print(F("[MQ raw/avg] "));
+  Serial.print(g_mqRaw); Serial.print('/'); Serial.print(g_mqAvg);
   Serial.print(F("  [state] "));
-  Serial.print( (g_state==STATE_NORMAL)?"NORMAL":(g_state==STATE_CAUTION)?"CAUTION":"DANGER" );
-  Serial.print(F("  [blocked] ")); Serial.print(g_blocked);
-  Serial.print(F("  [pathDir] ")); Serial.print(g_pathDir);
-  Serial.print(F("  [mode] ")); Serial.println(g_mode==MODE_AUTO?"AUTO":"MANUAL");
+  Serial.print(g_state==STATE_NORMAL?"NORMAL":g_state==STATE_CAUTION?"CAUTION":"DANGER");
+  Serial.print(F("  [mode] "));
+  Serial.print(g_mode==MODE_AUTO?"AUTO":"MANUAL");
+  Serial.print(F("  [fireZone] Z")); Serial.println(g_fireZone);
 }
 
-/* ========================== 상태/판정 로직 ========================== */
-void updateStateFromSensors() {
-  // ■ MQ-2 기준의 상태머신 (히스테리시스 적용)
-  AlarmState prev = g_state;
+/* --------------- Bluetooth parser (Serial1) --------------- */
+void handleBtLine(const String &line){
+  String s = line; s.trim();
+  s.toUpperCase();
 
-  switch (g_state) {
-    case STATE_NORMAL:
-      if (g_mq2Avg >= MQ2_CAUTION_ON) g_state = STATE_CAUTION;
-      if (g_mq2Avg >= MQ2_DANGER_ON)  g_state = STATE_DANGER;
-      break;
-    case STATE_CAUTION:
-      if (g_mq2Avg < MQ2_CAUTION_OFF) g_state = STATE_NORMAL;
-      if (g_mq2Avg >= MQ2_DANGER_ON)  g_state = STATE_DANGER;
-      break;
-    case STATE_DANGER:
-      if (g_mq2Avg < MQ2_DANGER_OFF)  g_state = STATE_CAUTION;
-      if (g_mq2Avg < MQ2_CAUTION_OFF) g_state = STATE_NORMAL;
-      break;
+  if (s.startsWith("ALARM ")){
+    // ALARM Z1..Z4
+    int z = s.lastChar() - '0';
+    if (z>=1 && z<=4){
+      g_fireZone = z;
+      g_state = (g_mode==MODE_MANUAL)? STATE_DANGER : g_state; // MANUAL이면 즉시 위험 처리
+      Serial1.print(F("OK ALARM Z")); Serial1.println(z);
+      Serial.print(F("OK ALARM Z")); Serial.println(z);
+      return;
+    }
+  }
+  if (s=="CLEAR"){
+    g_fireZone = 0;
+    if (g_mode==MODE_MANUAL) g_state = STATE_NORMAL;
+    Serial1.println(F("OK CLEAR")); Serial.println(F("OK CLEAR"));
+    return;
+  }
+  if (s=="MODE AUTO"){
+    g_mode = MODE_AUTO;  Serial1.println(F("OK MODE AUTO"));  Serial.println(F("OK MODE AUTO"));  return;
+  }
+  if (s=="MODE MANUAL"){
+    g_mode = MODE_MANUAL; Serial1.println(F("OK MODE MANUAL")); Serial.println(F("OK MODE MANUAL")); return;
+  }
+  if (s=="VERBOSE ON"){ /* 필요 시 로그레벨 변수 추가 */ Serial1.println(F("OK VERBOSE ON")); return; }
+  if (s=="VERBOSE OFF"){ /* 필요 시 로그레벨 변수 추가 */ Serial1.println(F("OK VERBOSE OFF")); return; }
+
+  Serial1.println(F("ERR UNKNOWN CMD"));
+}
+
+/* --------------- setup / loop --------------- */
+void setup(){
+  pinMode(PIN_FLAME_DO, INPUT_PULLUP); // 센서 모듈에 따라 Active Low/High 확인
+  attachInterrupt(digitalPinToInterrupt(PIN_FLAME_DO), isrDO, FALLING);
+
+  pinMode(PIN_IL_G, OUTPUT);
+  pinMode(PIN_IL_R, OUTPUT);
+  pinMode(PIN_IR_G, OUTPUT);
+  pinMode(PIN_IR_R, OUTPUT);
+  pinMode(PIN_EL_G, OUTPUT);
+  pinMode(PIN_ER_G, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  // 초기 소등
+  setLeft(false,false);
+  setRight(false,false);
+  setExt(false,false);
+  noTone(PIN_BUZZER);
+
+  Serial.begin(115200);
+  Serial1.begin(9600); // HC-06 기본 9600
+  while(!Serial){;}
+
+  Serial.println(F("System Initialized."));
+}
+
+void loop(){
+  // BT 수신(개행 기준)
+  while (Serial1.available()){
+    char c = Serial1.read();
+    if (c=='\n' || c=='\r'){
+      if (btLine.length()>0){ handleBtLine(btLine); btLine=""; }
+    } else btLine += c;
   }
 
-#if USE_FLAME
-  // ■ 불꽃 감지 시 즉시 DANGER로 승격 (프로젝트 정책에 맞게)
-  if (g_flame) g_state = STATE_DANGER;
-#endif
-
-  if (prev != g_state) {
-    applyStateSideEffects(g_state);
-    Serial.print(F("[STATE] ")); 
-    Serial.println((g_state==STATE_NORMAL)?"NORMAL":(g_state==STATE_CAUTION)?"CAUTION":"DANGER");
-  }
+  if (timePassed(tRead,  INTERVAL_READ_SENSORS)) readSensorsTask();
+  if (timePassed(tLogic, INTERVAL_UPDATE_LOGIC)) updateLogicTask();
+  if (timePassed(tLED,   INTERVAL_RENDER_LEDS )) renderLedsTask();
+  if (timePassed(tBeep,  INTERVAL_BEEP_ENGINE))  beepEngineTask();
+  if (timePassed(tLog,   INTERVAL_LOG_OUTPUT ))  logTask();
 }
-
-void applyStateSideEffects(AlarmState s) {
-  // 상태 전환 시 1회성 부수효과(로그, 초기 비프, LED 밝기 정책 등)
-  // 예: 위험 진입 시 즉시 경고음 1회
-  if (s == STATE_DANGER) {
-    tone(PIN_BUZZER, 3000, 200);
-  }
-}
-
-/* ============================== ISR ================================ */
-void IRAM_ATTR isrButton() {
-  uint32_t now = millis();
-  if (now - g_btnLastTick < 15) return; // 15ms 디바운스
-  g_btnLastTick = now;
-  g_btnInterruptFlag = true;
-}
-
-/* ============================== 유틸 =============================== */
-bool timePassed(uint32_t &tPrev, uint32_t interval) {
-  uint32_t now = millis();
-  if (now - tPrev >= interval) { tPrev = now; return true; }
-  return false;
-}
-
-/* ============================== TODO =============================== *
-1) 센서 드라이버
-   - MQ-2: 보정 곡선 적용(예: PPM 근사), 가열시간/안정화 고려
-   - DHT22: 습도/온도 임계 연동(연기+고온 동시 시 DANGER 가중)
-   - Flame: DO/아날로그 둘 다 지원(민감도 조정)
-
-2) LED 렌더(네오픽셀 ON 시)
-   - 세그먼트/존 테이블 설계: 출구/복도/차단 존 구분
-   - 경로계산(테이블/BFS) 결과를 러닝 애니메이션로 반영
-   - 밝기 제한/전력 계산(안전/소음 환경 고려)
-
-3) 상태/정책
-   - 상태 추가: FAULT(센서 에러), EVAC(피난 유도 강제) 등
-   - 수동모드(MANUAL) 기능: 버튼 짧게/길게 구분, 초기화 루틴
-   - 로깅 레벨(verbosity), SD/RTC 기록(타임스탬프 포함)
-
-4) 안전/현장 고려
-   - 부저 음량/주파수 인체공학 조정, 소방/피난 표준 검토
-   - 화재 시 전원/연기로 인한 센서 드리프트 보정
-
-5) 테스트
-   - 유닛테스트성 함수 분리(판정/히스테리시스/패턴)
-   - 시뮬레이션 입력(시리얼 명령으로 MQ-2 값 주입)
-* ================================================================== */
