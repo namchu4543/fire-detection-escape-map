@@ -27,6 +27,8 @@ const uint8_t PIN_BTN_INT   = 2;     // 인터럽트 버튼(예: INT0)
 const uint8_t PIN_MQ2_AO    = A0;    // MQ-2 아날로그 입력
 const uint8_t PIN_STATUSLED = 13;    // 보드 내장 LED(동작 확인)
 
+/*재근이 ㅇㅇㅇㅇㅇㅇㅇㅇㅇ*/
+
 #if USE_FLAME
 const uint8_t PIN_FLAME_DO  = 3;     // 불꽃센서 디지털 출력 (예시)
 #endif
